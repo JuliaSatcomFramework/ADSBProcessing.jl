@@ -1,0 +1,11 @@
+*.jl.*.cov
+*.jl.cov
+*.jl.mem
+/Manifest.toml
+/Manifest-v*.toml
+/docs/Manifest.toml
+/docs/build/
+/test/Manifest.toml
+test_*.jl
+coverage/
+.vscode/
