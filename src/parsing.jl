@@ -8,12 +8,12 @@ const TRACE_ENTRY_TYPE = @NamedTuple{dt::Float64, lat::Float64, lon::Float64, al
 const TABLE_ROW_TYPE = @NamedTuple{icao::String, timestamp::DateTime, trace::Vector{TRACE_ENTRY_TYPE}}
 
 # This function assumes the buffer is already either at the beginning or within the `trace` entry in the json file and just reads a single row, extracting the time offset, position and altitude of the entry of the trace row. It directly puts the row entry inside the vector `out`
-function read_trace_row(rbuf, out)
+function read_trace_row(rbuf, out; min_dt = 300)
     seekuntil(rbuf, "[") # We find the beginning of the trace entry, it is always inside an array of various parameters. We are actually only interested in the first 4, which are time offset, lat, lon and altitude
     rbuf.idx > 0 || return nothing # If the seeking actually didn't reach the target delimiter we exit early
     dt = parseuntil(Float64, rbuf, ",")::Float64
     last_dt = isempty(out) ? -Inf : last(out).dt
-    if dt - last_dt > 120
+    if dt - last_dt > min_dt
         lat = parseuntil(Float64, rbuf, ",")::Float64
         lon = parseuntil(Float64, rbuf, ",")::Float64
         alt = if startswith(rbuf, "\"ground")
@@ -51,15 +51,81 @@ function read_json_entry(jsonpath, rbuf::RawBuffer)
     return (; icao, timestamp=unix2datetime(timestamp), trace)
 end
 
-function process_json_subfolder(subfold)
-    rbuf = RawBuffer()
+function process_json_subfolder(subfold; nthreads=4, min_length = 1e6)
     fnames = readdir(subfold)
-    out = TABLE_ROW_TYPE[]
-    for fn in fnames
-        contains(fn, "~") && continue # We skip files with an invalid ICAO number
-        jsonpath = joinpath(subfold, fn)
-        obj = read_json_entry(jsonpath, rbuf)
-        push!(out, obj)
+    buf_ch = Channel{RawBuffer}(nthreads)
+    out_ch = Channel{Vector{TABLE_ROW_TYPE}}(nthreads)
+    for n in 1:nthreads
+        put!(buf_ch, RawBuffer())
+        put!(out_ch, TABLE_ROW_TYPE[])
     end
-    out
+    tforeach(fnames) do fn
+        contains(fn, "~") && return # We skip files with an invalid ICAO number
+        jsonpath = joinpath(subfold, fn)
+        try
+            rbuf = take!(buf_ch)
+            obj = read_json_entry(jsonpath, rbuf)
+            put!(buf_ch, rbuf)
+            if trace_length(obj) > min_length
+                out = take!(out_ch)
+                push!(out, obj)
+                put!(out_ch, out)
+            end
+        catch
+            rethrow()
+        end
+    end
+    close(buf_ch)
+    close(out_ch)
+    return vcat(out_ch...)
+end
+
+function extract_and_process_subfolder(tarpath, subfold_path)
+    return mktempdir() do dir
+        files = joinpath(subfold_path, "*")
+        cmd = `$(p7zip()) e $tarpath $(files) -o$dir`
+        # subdir
+        run(pipeline(cmd; stdout=devnull))
+        process_json_subfolder(dir)
+    end
+end
+
+function extract_traces_subfolders(tarpath)
+    cmd = `$(p7zip()) l $tarpath`
+    out = IOBuffer()
+    pipeline(cmd; stdout=out) |> run
+    readuntil(seekstart(out), "-----") # The first part of the output is header with some p7zip information. After a line with ---- we start having the list of files
+    psep = normpath("/")
+    delim = "." * psep
+    readuntil(out, delim) # We read till the first path entry
+    nms = String[]
+    while !eof(out)
+        push!(nms, readline(out))
+        readuntil(out, delim)
+    end
+    map(filter(endswith("json"), nms)) do nm
+        dirname(delim * nm)
+    end |> unique
+end
+
+function process_tarfile(tarpath, out = TABLE_ROW_TYPE[]; max_folders = nothing)
+    subfolds = extract_traces_subfolders(tarpath)
+    max_folders = @something max_folders length(subfolds)
+    for i in 1:max_folders
+        @info "Processing folder $i of $max_folders"
+        subfold = subfolds[i]
+        subout = extract_and_process_subfolder(tarpath, subfold)
+        append!(out, subout)
+    end
+    return out
+end
+
+function trace_length(entry::TABLE_ROW_TYPE)
+    (; trace) = entry
+    length(trace) > 1 || return 0.0
+    sum(eachindex(trace)[1:end-1]) do i
+        p1 = trace[i].lon, trace[i].lat
+        p2 = trace[i+1].lon, trace[i+1].lat
+        haversine(p1, p2)
+    end
 end
